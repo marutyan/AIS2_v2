@@ -83,21 +83,36 @@ class RTDETRv2Detector:
     def _load_model(self):
         """モデルを読み込む"""
         try:
-            # HuggingFace Hub経由でモデルを読み込み
-            from ultralytics import RTDETR
+            # RT-DETRv2の軽量モデルを使用
+            import torch.hub
             
-            # 軽量モデルを使用
-            model_path = "rtdetr-l.pt"  # 軽量版
+            # HuggingFace Hub経由でRT-DETRv2モデルを読み込み
+            self.model = torch.hub.load(
+                'lyuwenyu/RT-DETR', 
+                'rtdetrv2_r18vd', 
+                pretrained=True,
+                source='github'
+            )
             
-            self.model = RTDETR(model_path)
             self.model.to(self.device)
+            self.model.eval()
             
-            print(f"Model {self.model_name} loaded successfully")
+            print(f"RT-DETRv2 model loaded successfully on {self.device}")
             
         except Exception as e:
-            print(f"Error loading model: {e}")
-            # フォールバックとしてYOLOv8を使用（ただし、要求では禁止されているため注意）
-            raise RuntimeError(f"Failed to load RT-DETRv2 model: {e}")
+            print(f"Error loading RT-DETRv2 model: {e}")
+            print("Trying alternative loading method...")
+            
+            try:
+                # 代替方法: Ultralyticsの RTDETR を使用
+                from ultralytics import RTDETR
+                self.model = RTDETR('rtdetr-l.pt')  # 軽量版
+                self.model.to(self.device)
+                print(f"Fallback: Ultralytics RTDETR model loaded on {self.device}")
+                
+            except Exception as e2:
+                print(f"Fallback also failed: {e2}")
+                raise RuntimeError(f"Failed to load any RT-DETR model. Original error: {e}, Fallback error: {e2}")
     
     def _preprocess_image(self, image: np.ndarray) -> torch.Tensor:
         """
@@ -139,16 +154,83 @@ class RTDETRv2Detector:
         
         # 推論実行
         with torch.no_grad():
-            results = self.model(input_tensor)
+            try:
+                # RT-DETRv2の場合
+                outputs = self.model(input_tensor)
+                
+                # RT-DETRv2の出力形式を処理
+                if isinstance(outputs, dict):
+                    # RT-DETRv2の標準出力形式
+                    pred_boxes = outputs.get('pred_boxes', None)
+                    pred_logits = outputs.get('pred_logits', None)
+                    
+                    if pred_boxes is not None and pred_logits is not None:
+                        return self._process_rtdetr_outputs(pred_boxes, pred_logits, original_width, original_height)
+                
+                # Ultralyticsの場合
+                if hasattr(outputs, '__iter__') and hasattr(outputs[0], 'boxes'):
+                    return self._process_ultralytics_outputs(outputs)
+                
+                # 他の形式の場合
+                return self._process_generic_outputs(outputs, original_width, original_height)
+                
+            except Exception as e:
+                print(f"Detection error: {e}")
+                return []
+    
+    def _process_rtdetr_outputs(self, pred_boxes, pred_logits, orig_width, orig_height):
+        """RT-DETRv2の出力を処理"""
+        detections = []
         
-        # 結果を解析
+        # ソフトマックスでクラス確率を計算
+        pred_probs = torch.softmax(pred_logits, dim=-1)
+        
+        # バッチの最初の結果を取得
+        if pred_boxes.dim() == 3:
+            pred_boxes = pred_boxes[0]
+            pred_probs = pred_probs[0]
+        
+        for i in range(pred_boxes.shape[0]):
+            # 最も確率の高いクラスを取得（背景クラスを除く）
+            class_probs = pred_probs[i, :-1]  # 最後のクラスは背景
+            max_prob, class_id = torch.max(class_probs, dim=0)
+            
+            if max_prob.item() >= self.conf_threshold:
+                # バウンディングボックス（中心座標 + 幅高さ → 左上右下座標）
+                box = pred_boxes[i]
+                cx, cy, w, h = box
+                
+                # 正規化座標を元の画像座標に変換
+                x1 = int((cx - w/2) * orig_width)
+                y1 = int((cy - h/2) * orig_height)
+                x2 = int((cx + w/2) * orig_width)
+                y2 = int((cy + h/2) * orig_height)
+                
+                # 画像境界内にクリップ
+                x1 = max(0, min(x1, orig_width))
+                y1 = max(0, min(y1, orig_height))
+                x2 = max(0, min(x2, orig_width))
+                y2 = max(0, min(y2, orig_height))
+                
+                detection = {
+                    'bbox': [x1, y1, x2, y2],
+                    'confidence': max_prob.item(),
+                    'class_id': class_id.item(),
+                    'class_name': self.coco_classes[class_id.item()] if class_id.item() < len(self.coco_classes) else 'unknown'
+                }
+                detections.append(detection)
+        
+        return detections
+    
+    def _process_ultralytics_outputs(self, results):
+        """Ultralyticsの出力を処理"""
         detections = []
         
         for result in results:
             boxes = result.boxes
             if boxes is not None:
                 for i in range(len(boxes)):
-                    # バウンディングボックス（正規化座標から元の座標に変換）
+                    # バウンディングボックス
                     x1, y1, x2, y2 = boxes.xyxy[i].cpu().numpy()
                     
                     # 信頼度
@@ -166,6 +248,32 @@ class RTDETRv2Detector:
                             'class_name': self.coco_classes[class_id] if class_id < len(self.coco_classes) else 'unknown'
                         }
                         detections.append(detection)
+        
+        return detections
+    
+    def _process_generic_outputs(self, outputs, orig_width, orig_height):
+        """汎用的な出力処理"""
+        # 基本的な処理を実装
+        detections = []
+        
+        if torch.is_tensor(outputs):
+            # テンソル出力の場合の基本的な処理
+            # 形状に基づいて推測
+            if outputs.dim() == 3 and outputs.shape[-1] >= 6:  # [batch, num_detections, 6+]
+                batch_outputs = outputs[0] if outputs.shape[0] == 1 else outputs
+                
+                for detection in batch_outputs:
+                    if len(detection) >= 6:
+                        x1, y1, x2, y2, conf, cls = detection[:6]
+                        
+                        if conf >= self.conf_threshold:
+                            detection_dict = {
+                                'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                                'confidence': float(conf),
+                                'class_id': int(cls),
+                                'class_name': self.coco_classes[int(cls)] if int(cls) < len(self.coco_classes) else 'unknown'
+                            }
+                            detections.append(detection_dict)
         
         return detections
     
