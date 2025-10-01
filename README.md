@@ -34,8 +34,36 @@ uv pip install -e .
 
 ## 使用方法
 
+### 基本的な使用方法
+
 ```bash
-python src/main.py --input videos/input.mp4 --output videos/output.mp4
+# 仮想環境を有効化
+source .venv/bin/activate
+
+# 馬の検出・追跡を実行
+python src/main.py --input videos/realhorses.mp4 --target-class horse --output outputs/result.mp4
+
+# リアルタイム表示付きで実行
+python src/main.py --input videos/realhorses.mp4 --target-class horse --display
+
+# 信頼度を調整して実行
+python src/main.py --input videos/realhorses.mp4 --target-class horse --conf 0.3 --output outputs/result.mp4
+```
+
+### コマンドラインオプション
+
+- `--input, -i`: 入力動画ファイルのパス（必須）
+- `--output, -o`: 出力動画ファイルのパス（省略時は自動生成）
+- `--target-class, -t`: 追跡対象のクラス名（デフォルト: horse）
+- `--conf, -c`: 信頼度の閾値（デフォルト: 0.5）
+- `--display, -d`: リアルタイム表示を有効化
+- `--device`: 使用するデバイス（cpu, cuda, mps）
+
+### テスト実行
+
+```bash
+# システムテストを実行
+python test_system.py
 ```
 
 ## プロジェクト構造
